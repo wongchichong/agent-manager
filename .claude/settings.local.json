@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm typecheck *)",
+      "Bash(pnpm tsx *)",
+      "Bash(qodercli --help)",
+      "Bash(gemini --help)",
+      "Bash(qwen --help)",
+      "Bash(claude --model claude-haiku-4-5-20251001)",
+      "Bash(kill %1 echo \"---gemini---\" echo \"hello\")",
+      "Bash(gemini -m gemini-2.0-flash-lite)",
+      "Bash(kill %1)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(timeout 5 claude -p \"hello\" --model claude-haiku-4-5-20251001)",
+      "Bash(timeout 5 gemini -m gemini-2.0-flash-lite --prompt \"hello\")",
+      "Bash(timeout 5 qwen -m qwen-turbo -p \"hello\")",
+      "Bash(timeout 5 qodercli -p \"hello\" --model lite)",
+      "Bash(timeout 5 claude --model claude-haiku-4-5-20251001 -p \"hello\")",
+      "Bash(claude --model claude-haiku-4-5-20251001 -p \"say hi in 5 words\")",
+      "Bash(gemini -m gemini-2.0-flash-lite --prompt \"say hi in 5 words\")",
+      "Bash(gemini --prompt \"say hi in 5 words\")",
+      "Bash(qwen -p \"say hi in 5 words\")",
+      "Bash(qodercli -p \"say hi in 5 words\")",
+      "Bash(claude -p \"my favourite color is blue\" --model claude-haiku-4-5-20251001)",
+      "Bash(claude -p \"what is my favourite color?\" -c --model claude-haiku-4-5-20251001)"
+    ]
+  }
+}

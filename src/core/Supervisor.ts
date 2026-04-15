@@ -103,22 +103,22 @@ class Supervisor extends EventEmitter {
         return;
       }
 
+      const cleanup = () => {
+        agent.off('done', onDone);
+        agent.off('status', onStatus);
+      };
       const onDone = (full: string) => {
         cleanup();
         resolve(full);
       };
       const onStatus = (s: string) => {
-        if (s === 'error') {
+        if (s === 'error' || s === 'dead') {
           cleanup();
-          reject(new Error(`Agent "${id}" errored`));
+          reject(new Error(`Agent "${id}" ${s}`));
         }
       };
-      const cleanup = () => {
-        agent.off('done', onDone);
-        agent.off('status', onStatus);
-      };
 
-      agent.once('done', onDone);
+      agent.on('done', onDone);
       agent.on('status', onStatus);
       agent.send(prompt);
     });

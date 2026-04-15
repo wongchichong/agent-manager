@@ -296,7 +296,10 @@ export default function App() {
             hint('Supervisor is busy — wait for it to finish');
             return;
           }
-          hint(`Routing to supervisor "${state.supervisorId}"…`);
+          // Record user message in supervisor's session
+          const supSession = loadSession(state.supervisorId);
+          appendMessage(supSession, { role: 'user', content: raw, ts: Date.now() });
+          dispatch({ type: 'AGENTS_CHANGED', agents: syncAgents(manager) });
           supervisor.run(raw);
           return;
         }
@@ -434,16 +437,13 @@ export default function App() {
         case 'supervisor': {
           const id = args[0];
           if (!id) {
-            // Show current supervisor or clear
-            if (args[0] === 'off' || args[0] === 'none') {
-              supervisor = null;
-              dispatch({ type: 'SET_SUPERVISOR', id: null });
-              hint('Supervisor cleared — messages go to selected agent');
-            } else if (state.supervisorId) {
-              hint(`Current supervisor: "${state.supervisorId}"`);
-            } else {
-              hint('Usage: /supervisor <agent-id>  — designate orchestrator');
-            }
+            hint(state.supervisorId ? `Supervisor: "${state.supervisorId}"` : 'Usage: /supervisor <agent-id>');
+            break;
+          }
+          if (id === 'off' || id === 'none') {
+            supervisor = null;
+            dispatch({ type: 'SET_SUPERVISOR', id: null });
+            hint('Supervisor cleared — messages go to selected agent');
             break;
           }
           if (!manager.getAgent(id)) { hint(`Agent "${id}" not found`); break; }
@@ -558,7 +558,7 @@ export default function App() {
           hint(`Unknown command: /${cmd}  — try /help`);
       }
     },
-    [state.selectedId, state.agents, hint]
+    [state.selectedId, state.supervisorId, state.agents, hint]
   );
 
   // ── Derived ────────────────────────────────────────────────────────────────

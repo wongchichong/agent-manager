@@ -10,14 +10,20 @@ export interface AgentConfig {
   /** Args that come before the prompt flag, e.g. ["-m", "gpt-4"] */
   args: string[];
   /**
-   * Flag that precedes the prompt text.
-   * One-shot mode: spawn(cmd, [...args, promptFlag, promptText])
-   * If omitted, sends prompt text to stdin of a long-running process.
+   * Flag that precedes the prompt text in one-shot mode.
+   *   spawn(cmd, [...args, promptFlag, promptText, ...continueArgs?])
+   * If omitted, uses interactive PTY stdin mode (for CLIs that work without TTY).
    */
   promptFlag?: string;
   /**
-   * ms of stdout silence that signals end-of-response in interactive mode.
-   * Only used when promptFlag is not set. Default: 1500.
+   * Args appended on every call after the first to resume the session.
+   * e.g. ["--continue"] for claude/qwen, ["--resume", "latest"] for gemini.
+   * Only used when promptFlag is set.
+   */
+  continueArgs?: string[];
+  /**
+   * ms of stdout silence that signals end-of-response in interactive PTY mode.
+   * Default: 2500.
    */
   silenceMs?: number;
   color: string;

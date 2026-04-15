@@ -1,15 +1,12 @@
 import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
+import * as pty from 'node-pty';
 import { AgentConfig, AgentStatus } from '../types.js';
 
 export interface AgentEvents {
-  /** Incremental stdout chunk */
   data: (chunk: string) => void;
-  /** Full response collected — fires after process exit (one-shot) or silence timeout (interactive) */
   done: (full: string) => void;
-  /** stderr chunk */
   stderr: (chunk: string) => void;
-  /** Status changed */
   status: (s: AgentStatus) => void;
 }
 
@@ -18,22 +15,33 @@ declare interface Agent {
   emit<K extends keyof AgentEvents>(event: K, ...args: Parameters<AgentEvents[K]>): boolean;
 }
 
+type PtyPhase = 'starting' | 'ready' | 'echo' | 'responding';
+
 class Agent extends EventEmitter {
   readonly config: AgentConfig;
   status: AgentStatus = 'idle';
-  /** Rolling log of output lines (capped at 2 000) */
   lines: string[] = [];
 
+  // One-shot state
   private proc: ChildProcess | null = null;
+  private turnCount = 0;
+
+  // Interactive PTY state (for CLIs that work without TTY, e.g. qwen)
+  private ptyProc: pty.IPty | null = null;
+  private ptyPhase: PtyPhase = 'starting';
+  private pendingPrompt: string | null = null;
+
   private buf = '';
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly silenceMs: number;
+  private readonly startupMs = 2500;
+  private readonly echoDiscardMs = 700;
 
   constructor(config: AgentConfig) {
     super();
     this.setMaxListeners(50);
     this.config = config;
-    this.silenceMs = config.silenceMs ?? 1500;
+    this.silenceMs = config.silenceMs ?? 2500;
   }
 
   send(prompt: string): void {
@@ -44,30 +52,40 @@ class Agent extends EventEmitter {
     }
   }
 
-  /** Cancel current in-flight request without killing the process.
-   *  Sends SIGINT so the CLI stops generating; process stays alive for next send. */
   cancel(): void {
-    if (!this.proc || this.status !== 'thinking') return;
     this.clearSilenceTimer();
-    this.proc.kill('SIGINT');
+    if (this.config.promptFlag !== undefined) {
+      this.proc?.kill('SIGINT');
+    } else {
+      this.ptyProc?.write('\x03');
+    }
     this.buf = '';
     this.setStatus('idle');
   }
 
   kill(): void {
     this.clearSilenceTimer();
-    this.proc?.kill('SIGTERM');
-    setTimeout(() => this.proc?.kill('SIGKILL'), 2000);
+    if (this.config.promptFlag !== undefined) {
+      this.proc?.kill('SIGTERM');
+      setTimeout(() => this.proc?.kill('SIGKILL'), 2000);
+    } else {
+      this.ptyProc?.kill('SIGTERM');
+      this.ptyProc = null;
+    }
     this.setStatus('dead');
   }
 
-  // ── One-shot mode ────────────────────────────────────────────────────────
+  // ── One-shot mode (with optional session continuation) ────────────────────
 
   private spawnOneShot(prompt: string): void {
     this.setStatus('thinking');
     this.buf = '';
 
-    const args = [...this.config.args, this.config.promptFlag!, prompt];
+    // From the 2nd turn onward, append continueArgs to resume the session
+    const continueArgs = this.turnCount > 0 ? (this.config.continueArgs ?? []) : [];
+    const args = [...this.config.args, ...continueArgs, this.config.promptFlag!, prompt];
+    this.turnCount++;
+
     const proc = spawn(this.config.cmd, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -81,16 +99,11 @@ class Agent extends EventEmitter {
       this.pushLines(chunk);
       this.emit('data', chunk);
     });
-
-    proc.stderr?.on('data', (chunk: string) => {
-      this.emit('stderr', chunk);
-    });
-
+    proc.stderr?.on('data', (chunk: string) => this.emit('stderr', chunk));
     proc.on('error', (err) => {
       this.pushLines(`[error] ${err.message}`);
       this.setStatus('error');
     });
-
     proc.on('close', (code) => {
       const full = this.buf;
       this.buf = '';
@@ -99,66 +112,106 @@ class Agent extends EventEmitter {
     });
   }
 
-  // ── Interactive (persistent) mode ────────────────────────────────────────
+  // ── Interactive PTY mode (for qwen and other pipe-friendly CLIs) ──────────
 
   private writeStdin(prompt: string): void {
-    if (!this.proc || this.proc.exitCode !== null) {
-      this.spawnInteractive();
+    if (!this.ptyProc) {
+      this.pendingPrompt = prompt;
+      this.setStatus('thinking');
+      this.spawnPty();
+      return;
     }
-    this.buf = '';
-    this.setStatus('thinking');
-    this.resetSilenceTimer();
-    this.proc?.stdin?.write(prompt + '\n');
+    if (this.ptyPhase === 'starting') {
+      this.pendingPrompt = prompt;
+      this.setStatus('thinking');
+      return;
+    }
+    this.sendToPty(prompt);
   }
 
-  private spawnInteractive(): void {
-    this.proc = spawn(this.config.cmd, this.config.args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
+  private sendToPty(prompt: string): void {
+    this.setStatus('thinking');
+    this.ptyPhase = 'echo';
+    this.buf = '';
+    this.ptyProc!.write(prompt + '\r');
+
+    // Wait for echo to pass, then collect real response
+    this.silenceTimer = setTimeout(() => {
+      this.silenceTimer = null;
+      if (this.status !== 'thinking') return;
+      this.buf = '';
+      this.ptyPhase = 'responding';
+      // Silence timer starts on first response chunk (model API can be slow)
+    }, this.echoDiscardMs);
+  }
+
+  private spawnPty(): void {
+    const term = pty.spawn(this.config.cmd, this.config.args, {
+      name: 'xterm-256color',
+      cols: 220,
+      rows: 50,
+      env: { ...process.env, TERM: 'xterm-256color' },
     });
 
-    this.proc.stdout?.setEncoding('utf8');
-    this.proc.stderr?.setEncoding('utf8');
+    this.ptyProc = term;
+    this.ptyPhase = 'starting';
 
-    this.proc.stdout?.on('data', (chunk: string) => {
+    term.onData((chunk) => {
       this.buf += chunk;
       this.pushLines(chunk);
-      this.emit('data', chunk);
-      // Each chunk resets the silence timer — response ends when output goes quiet
-      if (this.status === 'thinking') {
+
+      if (this.ptyPhase === 'starting') {
         this.resetSilenceTimer();
+      } else if (this.ptyPhase === 'responding' && this.status === 'thinking') {
+        this.resetSilenceTimer();
+        this.emit('data', chunk);
       }
     });
 
-    this.proc.stderr?.on('data', (chunk: string) => {
-      this.emit('stderr', chunk);
-    });
-
-    this.proc.on('error', (err) => {
-      this.pushLines(`[error] ${err.message}`);
+    term.onExit(({ exitCode }) => {
       this.clearSilenceTimer();
-      this.setStatus('error');
-    });
-
-    this.proc.on('close', () => {
-      // Process died — flush whatever was in the buffer
-      this.clearSilenceTimer();
+      const wasResponding = this.ptyPhase === 'responding';
       const full = this.buf;
       this.buf = '';
-      if (full.trim()) this.emit('done', full);
-      this.setStatus('dead');
+      this.ptyProc = null;
+      this.ptyPhase = 'starting';
+      if (full.trim() && wasResponding) this.emit('done', full);
+      this.setStatus(exitCode === 0 ? 'dead' : 'error');
     });
+
+    this.resetSilenceTimer();
   }
+
+  // ── Silence timer ────────────────────────────────────────────────────────
 
   private resetSilenceTimer(): void {
     this.clearSilenceTimer();
+    const ms = this.ptyPhase === 'starting' ? this.startupMs : this.silenceMs;
     this.silenceTimer = setTimeout(() => {
-      if (this.status === 'thinking') {
+      this.silenceTimer = null;
+
+      if (this.ptyPhase === 'starting') {
+        this.ptyPhase = 'ready';
+        this.buf = '';
+        if (this.status !== 'dead' && this.status !== 'error') {
+          this.setStatus('idle');
+        }
+        if (this.pendingPrompt) {
+          const p = this.pendingPrompt;
+          this.pendingPrompt = null;
+          this.sendToPty(p);
+        }
+        return;
+      }
+
+      if (this.ptyPhase === 'responding' && this.status === 'thinking') {
         const full = this.buf;
         this.buf = '';
+        this.ptyPhase = 'ready';
         this.setStatus('idle');
         this.emit('done', full);
       }
-    }, this.silenceMs);
+    }, ms);
   }
 
   private clearSilenceTimer(): void {
@@ -173,9 +226,7 @@ class Agent extends EventEmitter {
   private pushLines(text: string): void {
     const incoming = text.split('\n').filter((l) => l.length > 0);
     this.lines.push(...incoming);
-    if (this.lines.length > 2000) {
-      this.lines = this.lines.slice(-2000);
-    }
+    if (this.lines.length > 2000) this.lines = this.lines.slice(-2000);
   }
 
   private setStatus(s: AgentStatus): void {

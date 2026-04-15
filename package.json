@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "ink": "^5.0.1",
+    "node-pty": "^1.1.0",
     "react": "^18.2.0"
   },
   "devDependencies": {

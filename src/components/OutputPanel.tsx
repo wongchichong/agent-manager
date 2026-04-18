@@ -41,10 +41,10 @@ export function OutputPanel({ agentId, agentColor, messages, liveChunk, focused,
     );
   }
 
-  // Each message → lines. Reserve 2 lines for border + header.
-  const available = Math.max(4, height - 4);
+  // Reserve 2 lines for border + header, 1 for padding
+  const available = Math.max(2, height - 4);
 
-  // Flatten to renderable lines
+  // Flatten to renderable lines — truncate long text lines to prevent overflow
   const allLines: Array<{ label: string; color: string; text: string }> = [];
   for (const msg of messages) {
     const lines = msg.content.split('\n');
@@ -69,10 +69,11 @@ export function OutputPanel({ agentId, agentColor, messages, liveChunk, focused,
     });
   }
 
-  const clampedOffset = Math.min(scrollOffset, Math.max(0, allLines.length - available));
-  const endIdx = clampedOffset === 0 ? undefined : allLines.length - clampedOffset;
-  const startIdx = Math.max(0, allLines.length - available - clampedOffset);
-  const visible = allLines.slice(startIdx, endIdx);
+  // Clamp scroll offset to valid range
+  const maxOffset = Math.max(0, allLines.length - available);
+  const clampedOffset = Math.min(scrollOffset, maxOffset);
+  const visibleStart = Math.max(0, allLines.length - available - clampedOffset);
+  const visible = allLines.slice(visibleStart, visibleStart + available);
   const isScrolled = clampedOffset > 0;
 
   return (
@@ -101,7 +102,7 @@ export function OutputPanel({ agentId, agentColor, messages, liveChunk, focused,
             <Text color={line.color as any} dimColor>
               {line.label}{' '}
             </Text>
-            <Text wrap="wrap">{line.text}</Text>
+            <Text>{line.text}</Text>
           </Box>
         ))}
       </Box>

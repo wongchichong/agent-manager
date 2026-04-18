@@ -1,39 +1,46 @@
 import { AgentManager } from './src/core/AgentManager.js';
 import { Supervisor } from './src/core/Supervisor.js';
 import { agentStoreList } from './src/core/AgentStore.js';
-import { Agent } from './src/core/Agent.js';
 
 const manager = new AgentManager();
+const configs = agentStoreList();
 
-// Only test with claude (supervisor) for now
-const configs = agentStoreList().filter(c => c.id === 'claude');
-console.log('Testing agent:', configs.map(c => c.id).join(', '));
+if (configs.length === 0) {
+  console.error('No agents configured.');
+  process.exit(1);
+}
 
 for (const config of configs) {
   manager.add(config);
 }
 
-const agent = manager.getAgent('claude')!;
-agent.on('status', (s) => console.log(`[claude] status → ${s}`));
-agent.on('done',   (f) => {
-  console.log(`\n[claude] DONE (${f.length} chars):`);
-  console.log(JSON.stringify(f.slice(0, 300)));
+manager.on('agentDone', (id, full) => {
+  console.log(`[done] ${id}: ${full.length} chars`);
+});
+
+// Use qoder (last config) as supervisor - it's in interactive PTY mode
+const supervisorConfig = configs[configs.length - 1];
+const supervisor = new Supervisor(supervisorConfig.id, manager);
+
+supervisor.on('step', (msg) => console.log(`\n[SUPERVISOR] ${msg}`));
+supervisor.on('done', (result) => {
+  console.log('\n========== FINAL ==========');
+  console.log(result);
+  console.log('===========================');
   process.exit(0);
 });
-agent.on('stderr', (e) => process.stderr.write(`[claude/err] ${e}`));
-
-// Patch: log all PTY data via the internal event
-(agent as any).on('data', (chunk: string) => {
-  process.stdout.write(`[DATA] ${JSON.stringify(chunk.slice(0, 80))}\n`);
+supervisor.on('error', (err) => {
+  console.error('\n[SUPERVISOR ERROR]', err);
+  process.exit(1);
 });
 
-console.log('\nWaiting 4s for startup, then sending prompt...\n');
+console.log('\nWaiting 2s for agent startup...\n');
 setTimeout(() => {
-  console.log('>>> Sending prompt now');
-  agent.send('What is 2+2? Reply with just the number.');
-}, 4000);
+  console.log('>>> Sending: "What is 2+2? Reply with just the number."');
+  supervisor.run('What is 2+2? Reply with just the number.');
+}, 2000);
 
 setTimeout(() => {
-  console.error('\nTIMED OUT after 30s');
+  console.error('\nTIMED OUT');
   process.exit(1);
-}, 30_000);
+}, 120_000);

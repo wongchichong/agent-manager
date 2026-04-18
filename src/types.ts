@@ -11,16 +11,15 @@ export interface AgentConfig {
   args: string[];
   /**
    * Flag that precedes the prompt text in one-shot mode.
-   *   spawn(cmd, [...args, promptFlag, promptText, ...continueArgs?])
+   *   spawn(cmd, [...args, promptFlag, promptText, ...resumeArgs])
    * If omitted, uses interactive PTY stdin mode (for CLIs that work without TTY).
    */
   promptFlag?: string;
   /**
-   * Args appended on every call after the first to resume the session.
-   * e.g. ["--continue"] for claude/qwen, ["--resume", "latest"] for gemini.
-   * Only used when promptFlag is set.
+   * Resume mode: "latest" to continue most recent session, "continue" alias,
+   * "new" for fresh session, or a specific session ID.
    */
-  continueArgs?: string[];
+  sessionResume?: string;
   /**
    * ms of stdout silence that signals end-of-response in interactive PTY mode.
    * Default: 2500.

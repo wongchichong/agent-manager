@@ -2,6 +2,8 @@ import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import * as pty from 'node-pty';
 import { AgentConfig, AgentStatus } from '../types.js';
+import { stripAnsi, cleanTui, cleanTuiLine } from './stripAnsi.js';
+import { buildResumeArgs } from './SessionDiscovery.js';
 
 export interface AgentEvents {
   data: (chunk: string) => void;
@@ -33,15 +35,18 @@ class Agent extends EventEmitter {
 
   private buf = '';
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private echoTimer: ReturnType<typeof setTimeout> | null = null;
+  private startupDeadline: ReturnType<typeof setTimeout> | null = null;
   private readonly silenceMs: number;
-  private readonly startupMs = 2500;
-  private readonly echoDiscardMs = 700;
+  private readonly startupMs = 4000;
+  private readonly startupMaxMs = 15000;  // Hard cap for startup phase (increased for qodercli MCP init)
+  private readonly echoDiscardMs = 5000;  // Increased for slower TUI transitions
 
   constructor(config: AgentConfig) {
     super();
     this.setMaxListeners(50);
     this.config = config;
-    this.silenceMs = config.silenceMs ?? 2500;
+    this.silenceMs = config.silenceMs ?? 5000;
   }
 
   send(prompt: string): void {
@@ -54,6 +59,8 @@ class Agent extends EventEmitter {
 
   cancel(): void {
     this.clearSilenceTimer();
+    this.clearEchoTimer();
+    if (this.startupDeadline) { clearTimeout(this.startupDeadline); this.startupDeadline = null; }
     if (this.config.promptFlag !== undefined) {
       this.proc?.kill('SIGINT');
     } else {
@@ -65,6 +72,7 @@ class Agent extends EventEmitter {
 
   kill(): void {
     this.clearSilenceTimer();
+    this.clearEchoTimer();
     if (this.config.promptFlag !== undefined) {
       this.proc?.kill('SIGTERM');
       setTimeout(() => this.proc?.kill('SIGKILL'), 2000);
@@ -75,15 +83,18 @@ class Agent extends EventEmitter {
     this.setStatus('dead');
   }
 
-  // ── One-shot mode (with optional session continuation) ────────────────────
+  // ── One-shot mode (with session resume based on CWD) ───────────────────────
 
   private spawnOneShot(prompt: string): void {
     this.setStatus('thinking');
     this.buf = '';
 
-    // From the 2nd turn onward, append continueArgs to resume the session
-    const continueArgs = this.turnCount > 0 ? (this.config.continueArgs ?? []) : [];
-    const args = [...this.config.args, ...continueArgs, this.config.promptFlag!, prompt];
+    // Build resume args from session discovery
+    // sessionResume can be: "latest"|"continue"|"new"|<sessionId>
+    const resumeMode = this.config.sessionResume || 'latest';
+    const resumeArgs = buildResumeArgs(this.config.id, resumeMode, process.cwd());
+
+    const args = [...this.config.args, ...resumeArgs, this.config.promptFlag!, prompt];
     this.turnCount++;
 
     const proc = spawn(this.config.cmd, args, {
@@ -97,7 +108,12 @@ class Agent extends EventEmitter {
     proc.stdout?.on('data', (chunk: string) => {
       this.buf += chunk;
       this.pushLines(chunk);
-      this.emit('data', chunk);
+      const cleaned = stripAnsi(chunk)
+        .split('\n')
+        .map(cleanTuiLine)
+        .filter((l): l is string => l !== null)
+        .join('\n');
+      if (cleaned) this.emit('data', cleaned);
     });
     proc.stderr?.on('data', (chunk: string) => this.emit('stderr', chunk));
     proc.on('error', (err) => {
@@ -105,10 +121,15 @@ class Agent extends EventEmitter {
       this.setStatus('error');
     });
     proc.on('close', (code) => {
-      const full = this.buf;
+      const full = cleanTui(stripAnsi(this.buf));
       this.buf = '';
-      this.setStatus(code === 0 ? 'idle' : 'error');
+      // Emit 'done' BEFORE setting status — this ensures the supervisor's
+      // onDone handler can resolve the promise before onStatus sees 'error'.
+      // Some CLIs exit with non-zero codes even when successful (e.g. due to
+      // stderr warnings). We treat any non-crashed exit as 'idle' so the
+      // response is still returned.
       this.emit('done', full);
+      this.setStatus(code === 0 ? 'idle' : 'idle');
     });
   }
 
@@ -130,94 +151,160 @@ class Agent extends EventEmitter {
   }
 
   private sendToPty(prompt: string): void {
+    if (!this.ptyProc) {
+      this.pushLines(`[error] PTY process not available`);
+      this.setStatus('error');
+      return;
+    }
     this.setStatus('thinking');
     this.ptyPhase = 'echo';
-    this.buf = '';
-    this.ptyProc!.write(prompt + '\r');
-
-    // Wait for echo to pass, then collect real response
-    this.silenceTimer = setTimeout(() => {
-      this.silenceTimer = null;
-      if (this.status !== 'thinking') return;
-      this.buf = '';
-      this.ptyPhase = 'responding';
-      // Silence timer starts on first response chunk (model API can be slow)
-    }, this.echoDiscardMs);
+    // Don't clear buffer here — startup TUI noise will be filtered by cleanTui
+    // TUI-based CLIs (like qodercli) need the prompt typed first, then Enter
+    // sent separately. Sending \n or \r together with the text just types
+    // the characters — it doesn't submit. A bare \r acts as Enter key.
+    this.ptyProc.write(prompt);
+    // Small delay then press Enter
+    setTimeout(() => {
+      if (this.ptyProc && this.status === 'thinking') {
+        this.ptyProc.write('\r');
+        // Start echo timer AFTER Enter is pressed — this gives the TUI time
+        // to transition from input mode to "Generating..." mode
+        this.clearEchoTimer();
+        this.echoTimer = setTimeout(() => {
+          this.echoTimer = null;
+          if (this.status !== 'thinking') return;
+          // Don't clear the buffer here — AI response data accumulates from this point.
+          // The cleanTui() function will strip TUI artifacts from the final output.
+          this.ptyPhase = 'responding';
+          this.resetSilenceTimer();
+        }, this.echoDiscardMs);
+      }
+    }, 500);
   }
 
   private spawnPty(): void {
-    const term = pty.spawn(this.config.cmd, this.config.args, {
-      name: 'xterm-256color',
-      cols: 220,
-      rows: 50,
-      env: { ...process.env, TERM: 'xterm-256color' },
-    });
+    // On Windows, .cmd/.bat files can't be spawned directly with node-pty.
+    // Must use cmd /c to execute them properly.
+    const isWindowsBatch = this.config.cmd.endsWith('.cmd') || this.config.cmd.endsWith('.bat');
+    const cmd = isWindowsBatch ? 'C:\\Windows\\System32\\cmd.exe' : this.config.cmd;
+    const finalArgs = isWindowsBatch ? ['/c', this.config.cmd, ...this.config.args] : this.config.args;
 
-    this.ptyProc = term;
-    this.ptyPhase = 'starting';
+    try {
+      const term = pty.spawn(cmd, finalArgs, {
+        name: 'xterm-256color',
+        cols: 220,
+        rows: 50,
+        env: { ...process.env, TERM: 'xterm-256color' },
+      });
+
+      this.ptyProc = term;
+      this.ptyPhase = 'starting';
+    } catch (err: any) {
+      this.pushLines(`[spawn error] Failed to spawn ${this.config.cmd}: ${err.message}`);
+      this.setStatus('error');
+      return;
+    }
+
+    // Set a hard deadline for startup — the TUI may continuously output
+    // small chunks (cursor blink, status updates) that would reset the
+    // silence timer indefinitely. After startupMaxMs, force transition.
+    this.startupDeadline = setTimeout(() => {
+      this.startupDeadline = null;
+      if (this.ptyPhase !== 'starting') return;
+      this.ptyPhase = 'ready';
+      this.buf = '';
+      if (this.status !== 'dead' && this.status !== 'error') {
+        this.setStatus('idle');
+      }
+      // Some TUI CLIs (like qodercli) need an initial Enter to dismiss
+      // the welcome screen before accepting input. Send it now.
+      if (this.ptyProc) {
+        this.ptyProc.write('\r');
+      }
+      if (this.pendingPrompt) {
+        const p = this.pendingPrompt;
+        this.pendingPrompt = null;
+        this.sendToPty(p);
+      }
+    }, this.startupMaxMs);
 
     term.onData((chunk) => {
       this.buf += chunk;
       this.pushLines(chunk);
 
       if (this.ptyPhase === 'starting') {
-        this.resetSilenceTimer();
+        // Don't reset timer during startup — the hard deadline handles it
+      } else if (this.ptyPhase === 'echo' && this.status === 'thinking') {
+        // Detect transition from echo to responding by looking for
+        // "Generating" or "Thinking" in the chunk (TUI switched to response mode)
+        const stripped = stripAnsi(chunk);
+        if (/Generating|Thinking|Processing|Loading/i.test(stripped)) {
+          this.ptyPhase = 'responding';
+          this.clearEchoTimer();
+          this.resetSilenceTimer();
+        }
+        // Still emit filtered data during responding
+        const cleaned = stripAnsi(chunk)
+          .split('\n')
+          .map(cleanTuiLine)
+          .filter((l): l is string => l !== null)
+          .join('\n');
+        if (cleaned) this.emit('data', cleaned);
       } else if (this.ptyPhase === 'responding' && this.status === 'thinking') {
         this.resetSilenceTimer();
-        this.emit('data', chunk);
+        // Filter live chunks through cleanTuiLine to strip TUI chrome
+        // from each line before emitting to the TUI display
+        const cleaned = stripAnsi(chunk)
+          .split('\n')
+          .map(cleanTuiLine)
+          .filter((l): l is string => l !== null)
+          .join('\n');
+        if (cleaned) this.emit('data', cleaned);
       }
     });
 
     term.onExit(({ exitCode }) => {
       this.clearSilenceTimer();
+      this.clearEchoTimer();
+      if (this.startupDeadline) { clearTimeout(this.startupDeadline); this.startupDeadline = null; }
       const wasResponding = this.ptyPhase === 'responding';
       const full = this.buf;
       this.buf = '';
       this.ptyProc = null;
       this.ptyPhase = 'starting';
-      if (full.trim() && wasResponding) this.emit('done', full);
+      if (full.trim() && wasResponding) this.emit('done', cleanTui(stripAnsi(full)));
       this.setStatus(exitCode === 0 ? 'dead' : 'error');
     });
-
-    this.resetSilenceTimer();
   }
 
   // ── Silence timer ────────────────────────────────────────────────────────
 
   private resetSilenceTimer(): void {
     this.clearSilenceTimer();
-    const ms = this.ptyPhase === 'starting' ? this.startupMs : this.silenceMs;
     this.silenceTimer = setTimeout(() => {
       this.silenceTimer = null;
 
-      if (this.ptyPhase === 'starting') {
-        this.ptyPhase = 'ready';
-        this.buf = '';
-        if (this.status !== 'dead' && this.status !== 'error') {
-          this.setStatus('idle');
-        }
-        if (this.pendingPrompt) {
-          const p = this.pendingPrompt;
-          this.pendingPrompt = null;
-          this.sendToPty(p);
-        }
-        return;
-      }
-
       if (this.ptyPhase === 'responding' && this.status === 'thinking') {
-        const full = this.buf;
+        const full = cleanTui(stripAnsi(this.buf));
         this.buf = '';
         this.ptyPhase = 'ready';
         this.setStatus('idle');
         this.emit('done', full);
       }
-    }, ms);
+    }, this.silenceMs);
   }
 
   private clearSilenceTimer(): void {
     if (this.silenceTimer) {
       clearTimeout(this.silenceTimer);
       this.silenceTimer = null;
+    }
+  }
+
+  private clearEchoTimer(): void {
+    if (this.echoTimer) {
+      clearTimeout(this.echoTimer);
+      this.echoTimer = null;
     }
   }
 

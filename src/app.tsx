@@ -327,33 +327,33 @@ export default function App() {
 
       switch (cmd) {
         case 'add': {
-          // /add <id> <cmd> [args...] [--flag <flag>]
-          // e.g. /add claude claude -p
-          // e.g. /add gemini gemini --flag --prompt
+          // /add <id> <cmd> [args…] [--resume latest|<id>|new] [--silenceMs <n>] [--flag <flag>]
+          // One-shot with resume:  /add qoder qodercli --model lite --flag -p --resume latest
+          // One-shot new session: /add qoder qodercli --model lite --flag -p --resume new
           if (args.length < 2) {
-            hint('Usage: /add <id> <cmd> [args…]  append --flag <f> to set promptFlag');
+            hint('Usage: /add <id> <cmd> [args…] --flag -p --resume latest|new|<sessionId>');
             break;
           }
           const id = args[0];
           const binCmd = args[1];
 
-          // Look for --flag sentinel
           let promptFlag: string | undefined;
-          const flagIdx = args.indexOf('--flag');
-          let restArgs: string[];
-          if (flagIdx !== -1 && args[flagIdx + 1]) {
-            promptFlag = args[flagIdx + 1];
-            restArgs = args.slice(2, flagIdx);
-          } else {
-            // Last arg that starts with - is treated as promptFlag shorthand
-            const rest = args.slice(2);
-            const lastDash = [...rest].reverse().findIndex((a) => a.startsWith('-'));
-            if (lastDash !== -1) {
-              const idx = rest.length - 1 - lastDash;
-              promptFlag = rest[idx];
-              restArgs = rest.filter((_, i) => i !== idx);
+          let sessionResume: string | undefined;
+          let silenceMs: number | undefined;
+          const restArgs: string[] = [];
+
+          for (let i = 2; i < args.length; i++) {
+            if (args[i] === '--flag' && args[i + 1]) {
+              promptFlag = args[i + 1];
+              i++;
+            } else if (args[i] === '--resume' && args[i + 1]) {
+              sessionResume = args[i + 1];
+              i++;
+            } else if (args[i] === '--silenceMs' && args[i + 1]) {
+              silenceMs = parseInt(args[i + 1], 10);
+              i++;
             } else {
-              restArgs = rest;
+              restArgs.push(args[i]);
             }
           }
 
@@ -363,12 +363,15 @@ export default function App() {
               cmd: binCmd,
               args: restArgs,
               promptFlag,
+              sessionResume,
+              silenceMs,
               color: nextColor(),
             };
             manager.add(config);
             agentStoreSave(config);
             dispatch({ type: 'SELECT', id });
-            hint(`Added agent "${id}" → ${binCmd}${promptFlag ? ' ' + promptFlag : ''}`);
+            const mode = promptFlag ? `one-shot` : 'interactive';
+            hint(`Added "${id}" → ${binCmd}${restArgs.length ? ' ' + restArgs.join(' ') : ''} [${mode}]${sessionResume ? ` --resume ${sessionResume}` : ''}${silenceMs ? ` ${silenceMs}ms` : ''}`);
           } catch (e: any) {
             hint(`Error: ${e.message}`);
           }

@@ -1,6 +1,6 @@
 export type AgentStatus = 'idle' | 'thinking' | 'error' | 'dead';
 export type LogLevel = 'info' | 'warn' | 'error' | 'success';
-export type Panel = 'agents' | 'output';
+export type Panel = 'agents' | 'output' | 'input';
 
 /** What gets persisted and passed to /add */
 export interface AgentConfig {

@@ -1,15 +1,16 @@
-import React, { useState, useEffect, useCallback, useReducer } from 'react';
+import React, { useState, useEffect, useCallback, useReducer, useRef } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
 import { AgentManager } from './core/AgentManager.js';
 import { loadSession, appendMessage, clearSession } from './core/Session.js';
 import { memSet, memGet, memDel, memList } from './core/Memory.js';
 import { Header } from './components/Header.js';
 import { AgentList } from './components/AgentList.js';
-import { OutputPanel } from './components/OutputPanel.js';
+import { OutputPanel, OutputView } from './components/OutputPanel.js';
 import { MemoryBar } from './components/MemoryBar.js';
 import { InputBar } from './components/InputBar.js';
 import { agentStoreSave, agentStoreRemove, agentStoreList } from './core/AgentStore.js';
 import { Supervisor } from './core/Supervisor.js';
+import { encodeKeystroke } from './core/keys.js';
 import {
   AgentConfig,
   AgentStatus,
@@ -44,6 +45,14 @@ interface AppState {
   hint: string;
   supervisorId: string | null;
   supervisorStep: string;
+  /** Per-agent view mode (chat | raw). Defaults to chat. */
+  viewModes: Record<string, OutputView>;
+  /** Per-agent latest screen snapshot rows (ANSI). Updated on agentScreen. */
+  screens: Record<string, string[]>;
+  /** Bumped to force re-read of snapshot when screen event fires. */
+  screenTick: number;
+  /** True between a Ctrl+B and the next keystroke (leader is armed). */
+  leaderArmed: boolean;
 }
 
 type Action =
@@ -58,10 +67,13 @@ type Action =
   | { type: 'AGENT_STATUS'; id: string; status: AgentStatus }
   | { type: 'AGENT_DATA'; id: string; chunk: string }
   | { type: 'AGENT_DONE'; id: string; full: string }
+  | { type: 'AGENT_SCREEN'; id: string; rows: string[] }
+  | { type: 'SET_VIEW'; id: string; view: OutputView }
   | { type: 'MEMORY_CHANGED'; memory: MemoryEntry[] }
   | { type: 'LOG'; entry: LogEntry }
   | { type: 'SET_SUPERVISOR'; id: string | null }
-  | { type: 'SUPERVISOR_STEP'; step: string };
+  | { type: 'SUPERVISOR_STEP'; step: string }
+  | { type: 'LEADER_ARMED'; armed: boolean };
 
 const AGENT_COLORS = ['cyan', 'magenta', 'yellow', 'green', 'blue', 'red', 'white'];
 let colorIdx = 0;
@@ -109,6 +121,17 @@ function reducer(state: AppState, action: Action): AppState {
       const { [action.id]: _dropped, ...rest } = state.liveChunks;
       return { ...state, liveChunks: rest };
     }
+    case 'AGENT_SCREEN':
+      return {
+        ...state,
+        screens: { ...state.screens, [action.id]: action.rows },
+        screenTick: state.screenTick + 1,
+      };
+    case 'SET_VIEW':
+      return {
+        ...state,
+        viewModes: { ...state.viewModes, [action.id]: action.view },
+      };
     case 'MEMORY_CHANGED':
       return { ...state, memory: action.memory };
     case 'LOG': {
@@ -119,6 +142,8 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, supervisorId: action.id, supervisorStep: '' };
     case 'SUPERVISOR_STEP':
       return { ...state, supervisorStep: action.step };
+    case 'LEADER_ARMED':
+      return { ...state, leaderArmed: action.armed };
     default:
       return state;
   }
@@ -151,13 +176,17 @@ export default function App() {
     memory: memList(),
     log: [],
     liveChunks: {},
-    panel: 'agents',
+    panel: 'output',
     cursor: 0,
     scrollOffset: 0,
     inputValue: '',
     hint: '',
     supervisorId: null,
     supervisorStep: '',
+    viewModes: {},
+    screens: {},
+    screenTick: 0,
+    leaderArmed: false,
   });
 
   // ── Subscribe to manager events ───────────────────────────────────────────
@@ -180,6 +209,13 @@ export default function App() {
       }
     };
     const onData = (id: string, chunk: string) => {
+      // Skip when not relevant to the current view. Raw mode shows the
+      // snapshot, never the streaming liveChunks; non-selected agents
+      // aren't shown either. Both cases would re-render App for nothing
+      // and (with lots of slave output) flicker the chrome.
+      if (id !== selectedIdRef.current) return;
+      const view = viewModesRef.current[id] ?? 'raw';
+      if (view === 'raw') return;
       dispatch({ type: 'AGENT_DATA', id, chunk });
     };
     const onDone = (id: string, full: string) => {
@@ -194,12 +230,22 @@ export default function App() {
         log('success', `agent "${id}" replied (${full.trim().length} chars)`);
       }
     };
+    const onScreen = (id: string) => {
+      // Only update screens for the currently-selected agent — others aren't
+      // shown anywhere, so re-rendering on every byte they emit is wasted
+      // work that flickers the chrome via Ink's clear-and-redraw cycle.
+      if (id !== selectedIdRef.current) return;
+      const agent = manager.getAgent(id);
+      if (!agent) return;
+      dispatch({ type: 'AGENT_SCREEN', id, rows: agent.snapshot() });
+    };
 
     manager.on('agentsChanged', onChanged);
     manager.on('pipesChanged', onPipes);
     manager.on('agentStatus', onStatus);
     manager.on('agentData', onData);
     manager.on('agentDone', onDone);
+    manager.on('agentScreen', onScreen);
 
     return () => {
       manager.off('agentsChanged', onChanged);
@@ -207,6 +253,7 @@ export default function App() {
       manager.off('agentStatus', onStatus);
       manager.off('agentData', onData);
       manager.off('agentDone', onDone);
+      manager.off('agentScreen', onScreen);
     };
   }, []);
 
@@ -232,24 +279,103 @@ export default function App() {
     return () => clearTimeout(t);
   }, [state.hint]);
 
-  // ── Keyboard navigation ───────────────────────────────────────────────────
+  // Ref mirror of panel — keeps Tab cycling correct when keystrokes arrive
+  // back-to-back within a single React tick (state hasn't re-rendered yet).
+  const panelRef = useRef(state.panel);
+  panelRef.current = state.panel;
+
+  // Ref mirror of selectedId — used by the screen-event handler to skip
+  // dispatches for non-selected agents (their snapshots aren't shown, so
+  // re-rendering on every byte they emit is pure waste).
+  const selectedIdRef = useRef(state.selectedId);
+  selectedIdRef.current = state.selectedId;
+
+  // Ref mirror of viewModes — onData skips dispatch in raw mode (snapshot
+  // is the source of truth there; liveChunks would just churn re-renders).
+  const viewModesRef = useRef(state.viewModes);
+  viewModesRef.current = state.viewModes;
+
+  // Leader-key state. When true, the NEXT keystroke is a master command.
+  // tmux-style: Ctrl+B then i / a / c / 0..9 / b / ?.
+  const leaderArmedRef = useRef(false);
+
+  // ── Keyboard input ────────────────────────────────────────────────────────
+  // Routing precedence:
+  //   1. Leader-armed?           → consume one key as a master command
+  //   2. Ctrl+B (the leader key) → arm, swallow
+  //   3. panel === 'output'      → forward keystrokes to slave PTY
+  //   4. panel === 'agents'      → arrow / enter navigate the taskbar
+  //   5. panel === 'input'       → InputBar consumes (its own useInput)
   useInput((input, key) => {
-    // ESC — cancel current in-progress request on selected agent
-    if (key.escape) {
-      if (state.selectedId) {
-        const agent = manager.getAgent(state.selectedId);
-        if (agent?.status === 'thinking') {
-          agent.cancel();
-          hint(`Cancelled "${state.selectedId}"`);
-        }
+    // 1. Leader command: previous keystroke was Ctrl+B; this one is the verb.
+    if (leaderArmedRef.current) {
+      leaderArmedRef.current = false;
+      dispatch({ type: 'LEADER_ARMED', armed: false });
+      // Cancel leader on Esc
+      if (key.escape) { hint('leader cancelled'); return; }
+
+      if (input === 'i' || input === ':') {
+        panelRef.current = 'input';
+        dispatch({ type: 'SET_PANEL', panel: 'input' });
+        hint('input: type a /command, Enter to run, Esc to cancel');
+        return;
       }
+      if (input === 'a') {
+        panelRef.current = 'agents';
+        dispatch({ type: 'SET_PANEL', panel: 'agents' });
+        return;
+      }
+      if (input === 'c') {
+        if (state.selectedId) {
+          const agent = manager.getAgent(state.selectedId);
+          if (agent?.status === 'thinking') {
+            agent.cancel();
+            hint(`cancelled "${state.selectedId}"`);
+          }
+        }
+        return;
+      }
+      // 0-9 picks the Nth agent and brings it forward
+      if (input && /^[0-9]$/.test(input)) {
+        const idx = parseInt(input, 10);
+        const target = state.agents[idx];
+        if (target) {
+          dispatch({ type: 'SELECT', id: target.id });
+          dispatch({ type: 'SET_CURSOR', cursor: idx });
+          panelRef.current = 'output';
+          dispatch({ type: 'SET_PANEL', panel: 'output' });
+        }
+        return;
+      }
+      // 'b' = forward a literal Ctrl+B to the slave (escape the leader)
+      if (input === 'b' && state.selectedId) {
+        manager.getAgent(state.selectedId)?.write('\x02');
+        return;
+      }
+      if (input === '?') {
+        hint('Ctrl+B then  i input · a agents · c cancel · 0-9 pick · b literal');
+        return;
+      }
+      hint(`leader: unknown "${input || '?'}"`);
       return;
     }
-    if (key.tab) {
-      dispatch({ type: 'SET_PANEL', panel: state.panel === 'agents' ? 'output' : 'agents' });
+
+    // 2. Arm leader on Ctrl+B
+    if (key.ctrl && (input === 'b' || input === 'B')) {
+      leaderArmedRef.current = true;
+      dispatch({ type: 'LEADER_ARMED', armed: true });
       return;
     }
-    if (state.panel === 'agents') {
+
+    // 3. Output panel = slave passthrough. Encode and forward everything.
+    if (panelRef.current === 'output' && state.selectedId) {
+      const bytes = encodeKeystroke(input, key);
+      if (bytes !== null) manager.getAgent(state.selectedId)?.write(bytes);
+      return;
+    }
+
+    // 4. Taskbar (agents panel) navigation
+    if (panelRef.current === 'agents') {
       if (key.upArrow) {
         const next = Math.max(0, state.cursor - 1);
         dispatch({ type: 'SET_CURSOR', cursor: next });
@@ -266,47 +392,63 @@ export default function App() {
       }
       if (key.return && state.agents[state.cursor]) {
         dispatch({ type: 'SELECT', id: state.agents[state.cursor].id });
+        panelRef.current = 'output';
         dispatch({ type: 'SET_PANEL', panel: 'output' });
         return;
       }
+      if (key.escape) {
+        panelRef.current = 'output';
+        dispatch({ type: 'SET_PANEL', panel: 'output' });
+        return;
+      }
+      return;
     }
-    if (state.panel === 'output') {
-      if (key.upArrow) {
-        dispatch({ type: 'SET_SCROLL', offset: state.scrollOffset + 1 });
-        return;
-      }
-      if (key.downArrow) {
-        dispatch({ type: 'SET_SCROLL', offset: Math.max(0, state.scrollOffset - 1) });
-        return;
-      }
+
+    // 5. panel === 'input' — InputBar handles it via its own useInput.
+    //    We only intercept Esc to bail back to output mode.
+    if (panelRef.current === 'input' && key.escape) {
+      panelRef.current = 'output';
+      dispatch({ type: 'SET_PANEL', panel: 'output' });
+      dispatch({ type: 'SET_INPUT', value: '' });
+      return;
     }
   });
 
   // ── Command parser ────────────────────────────────────────────────────────
   const hint = useCallback((msg: string) => dispatch({ type: 'SET_HINT', hint: msg }), []);
+  // Stable onChange so memoised InputBar isn't invalidated every parent render.
+  const onInputChange = useCallback(
+    (v: string) => dispatch({ type: 'SET_INPUT', value: v }),
+    [],
+  );
 
   const handleSubmit = useCallback(
     (raw: string) => {
-      if (!raw.trim()) return;
+      // After every submit, return to slave-passthrough mode.
+      const finish = () => {
+        panelRef.current = 'output';
+        dispatch({ type: 'SET_PANEL', panel: 'output' });
+      };
+      if (!raw.trim()) { finish(); return; }
 
       if (!raw.startsWith('/')) {
         // Route through supervisor if one is set
         if (state.supervisorId && supervisor) {
           if (supervisor.running) {
             hint('Supervisor is busy — wait for it to finish');
-            return;
+            finish(); return;
           }
           // Record user message in supervisor's session
           const supSession = loadSession(state.supervisorId);
           appendMessage(supSession, { role: 'user', content: raw, ts: Date.now() });
           dispatch({ type: 'AGENTS_CHANGED', agents: syncAgents(manager) });
           supervisor.run(raw);
-          return;
+          finish(); return;
         }
         // Direct message to selected agent
         if (!state.selectedId) {
           hint('No agent selected — use /add or /supervisor first');
-          return;
+          finish(); return;
         }
         try {
           const session = loadSession(state.selectedId);
@@ -316,7 +458,7 @@ export default function App() {
         } catch (e: any) {
           hint(`Error: ${e.message}`);
         }
-        return;
+        finish(); return;
       }
 
       // Parse slash command
@@ -472,6 +614,17 @@ export default function App() {
           break;
         }
 
+        case 'view': {
+          // /view chat|raw [id]
+          const mode = args[0];
+          const id = args[1] ?? state.selectedId;
+          if (!id) { hint('Usage: /view chat|raw [id]'); break; }
+          if (mode !== 'chat' && mode !== 'raw') { hint('Usage: /view chat|raw [id]'); break; }
+          dispatch({ type: 'SET_VIEW', id, view: mode });
+          hint(`View "${id}" → ${mode}`);
+          break;
+        }
+
         case 'select': {
           const id = args[0];
           if (!id) { hint('Usage: /select <id>'); break; }
@@ -535,7 +688,7 @@ export default function App() {
 
         case 'help': {
           hint(
-            'ESC cancel request  /add /send /supervisor /pipe /unpipe /broadcast /kill /quit /select /clear /mem /list /log /app-exit'
+            'ESC cancel  /view chat|raw  /add /send /supervisor /pipe /unpipe /broadcast /kill /quit /select /clear /mem /list /log /app-exit'
           );
           break;
         }
@@ -560,6 +713,7 @@ export default function App() {
         default:
           hint(`Unknown command: /${cmd}  — try /help`);
       }
+      finish();
     },
     [state.selectedId, state.supervisorId, state.agents, hint]
   );
@@ -567,8 +721,48 @@ export default function App() {
   // ── Derived ────────────────────────────────────────────────────────────────
   const selectedRow = state.agents.find((a) => a.id === state.selectedId) ?? null;
   const termHeight = process.stdout.rows ?? 40;
-  // Header ~3, InputBar ~3, MemoryBar ~1, padding — output panel gets the rest
-  const outputHeight = Math.max(8, termHeight - 9);
+  const termWidth = process.stdout.columns ?? 120;
+  // Compute the actual height of the row that contains AgentList + OutputPanel.
+  // Header is 3 rows (rounded border + 1 content). InputBar is 3 (or 4 with a
+  // hint). MemoryBar adds 2 rows when there are entries, else 0.
+  const headerH = 3;
+  const memBarH = state.memory.length > 0 ? 2 : 0;
+  // InputBar always reserves 4 rows (round border + hint row + prompt row +
+  // bottom border), even when no hint is present. Keeps flexHeight stable
+  // so toggling a hint doesn't relayout the panels above.
+  const inputBarH = 4;
+  const flexHeight = Math.max(8, termHeight - headerH - memBarH - inputBarH);
+  // AgentList consumes the left column (22 cols incl. border); the output
+  // panel gets the rest.
+  const outputWidth = Math.max(40, termWidth - 22);
+  const selectedView: OutputView = state.selectedId
+    ? (state.viewModes[state.selectedId] ?? 'raw')
+    : 'raw';
+  const selectedScreen = state.selectedId ? (state.screens[state.selectedId] ?? []) : [];
+
+  // Resize the slave PTY/terminal of the selected agent in raw mode so its
+  // output matches the visible viewport. OutputPanel's content area =
+  // outerWidth - 4 (border + paddingX) cols × outerHeight - 4 rows (border +
+  // header content + header bottom border + bottom border).
+  useEffect(() => {
+    if (!state.selectedId || selectedView !== 'raw') return;
+    const agent = manager.getAgent(state.selectedId);
+    if (!agent) return;
+    agent.resize(
+      Math.max(40, outputWidth - 4),
+      Math.max(5, flexHeight - 4),
+    );
+  }, [state.selectedId, selectedView, outputWidth, flexHeight]);
+
+  // When the selected agent changes, eagerly load its current snapshot — we
+  // skip per-agent screen dispatches when not selected (see onScreen above),
+  // so the cached state.screens entry might be stale on switch.
+  useEffect(() => {
+    if (!state.selectedId) return;
+    const agent = manager.getAgent(state.selectedId);
+    if (!agent) return;
+    dispatch({ type: 'AGENT_SCREEN', id: state.selectedId, rows: agent.snapshot() });
+  }, [state.selectedId]);
 
   return (
     <Box flexDirection="column" height={termHeight}>
@@ -577,6 +771,8 @@ export default function App() {
         pipeCount={state.pipes.length}
         supervisorId={state.supervisorId}
         supervisorStep={state.supervisorStep}
+        leaderArmed={state.leaderArmed}
+        active={state.agents.some((a) => a.status === 'thinking') || !!state.supervisorStep}
       />
 
       <Box flexGrow={1}>
@@ -586,6 +782,7 @@ export default function App() {
           selectedId={state.selectedId}
           focused={state.panel === 'agents'}
           cursor={state.cursor}
+          height={flexHeight}
         />
         <OutputPanel
           agentId={state.selectedId}
@@ -593,8 +790,11 @@ export default function App() {
           messages={selectedRow?.session.messages ?? []}
           liveChunk={state.selectedId ? (state.liveChunks[state.selectedId] ?? '') : ''}
           focused={state.panel === 'output'}
-          height={outputHeight}
+          height={flexHeight}
+          width={outputWidth}
           scrollOffset={state.scrollOffset}
+          view={selectedView}
+          screen={selectedScreen}
         />
       </Box>
 
@@ -602,10 +802,11 @@ export default function App() {
 
       <InputBar
         value={state.inputValue}
-        onChange={(v) => dispatch({ type: 'SET_INPUT', value: v })}
+        onChange={onInputChange}
         onSubmit={handleSubmit}
         selectedAgent={state.selectedId}
         hint={state.hint}
+        active={state.panel === 'input'}
       />
     </Box>
   );

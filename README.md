@@ -90,14 +90,40 @@ The app detects end-of-response by watching for stdout silence. When no new outp
 - **Increase** if the agent pauses mid-response (e.g., 8000-10000ms)
 - **Decrease** for fast agents to reduce wait time (e.g., 3000ms)
 
-## TUI Commands
+## Keymap (tmux-style)
+
+AgentMan is a TUI window manager: the AgentList on the left is the **taskbar**,
+the OutputPanel on the right shows the **active slave's full TUI**, and your
+keystrokes go straight to that slave like a real terminal. Use the **leader
+key** `Ctrl+B` to talk to the master.
+
+| Mode | Key | Action |
+|------|-----|--------|
+| **default** (output focused) | _any printable, ESC, arrows, Tab, Backspace, Ctrl+letter_ | → forwarded to active slave's PTY |
+| | `Ctrl+B` | arm leader (status bar shows the keymap) |
+| | `Ctrl+C` | exit AgentMan |
+| **after `Ctrl+B`** | `i` | open master input bar (run `/commands`) |
+| | `a` | focus AgentList (taskbar) |
+| | `c` | cancel current slave request |
+| | `0`–`9` | jump to Nth agent |
+| | `b` | send literal `Ctrl+B` to slave |
+| | `?` | show keymap hint |
+| | `Esc` | cancel leader (no-op) |
+| **AgentList focused** | `↑` `↓` | navigate the taskbar |
+| | `Enter` | bring selected agent to front + return to slave |
+| | `Esc` | cancel + return to slave |
+| **Master input focused** | _any_ | type a `/command` |
+| | `Enter` | run command + return to slave |
+| | `Esc` | cancel + return to slave |
+| | `Ctrl+U` | clear input line |
+
+### Master `/commands`
 
 | Command | Description |
 |---------|-------------|
 | `/add <id> <cmd> [args…]` | Add and spawn a new agent |
 | `/quit [id]` | Kill agent process (default: selected) |
-| `/exit [id]` | Alias for /quit |
-| `/kill <id>` | Alias for /quit |
+| `/exit [id]` / `/kill <id>` | Aliases for `/quit` |
 | `/supervisor <id>` | Designate agent as supervisor |
 | `/supervisor off` | Clear supervisor |
 | `/send <id> <prompt>` | Send directly to a specific agent |
@@ -105,17 +131,13 @@ The app detects end-of-response by watching for stdout silence. When no new outp
 | `/pipe <from> <to>` | Auto-pipe agent A output → agent B input |
 | `/unpipe <from>` | Remove pipe |
 | `/select <id>` | Select agent in panel |
+| `/view chat\|raw [id]` | Switch panel between cleaned chat log and full TUI relay (raw is default) |
 | `/clear [id]` | Clear session history |
-| `/mem set <key> <value>` | Store memory entry |
-| `/mem get <key>` | Read memory entry |
-| `/mem del <key>` | Delete memory entry |
-| `/mem list` | List all memory |
+| `/mem set\|get\|del\|list` | Memory store at `~/.agentman/memory.json` |
 | `/list` | List active agent IDs |
 | `/log` | Show last 10 log entries |
 | `/help` | Show available commands |
 | `/app-exit` | Exit the TUI app |
-| `ESC` | Cancel current in-progress request |
-| `Tab` | Switch between agent list and output panel |
 
 ## Supervisor Flow
 

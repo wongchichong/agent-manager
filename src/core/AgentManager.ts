@@ -9,6 +9,8 @@ export interface ManagerEvents {
   agentDone: (agentId: string, full: string) => void;
   /** Any agent's status changed */
   agentStatus: (agentId: string) => void;
+  /** Any agent's screen buffer changed (PTY mode only). Throttled. */
+  agentScreen: (agentId: string) => void;
   /** Agent list changed (add/remove) */
   agentsChanged: () => void;
   /** Pipe list changed */
@@ -33,6 +35,7 @@ class AgentManager extends EventEmitter {
 
     agent.on('data', (chunk) => this.emit('agentData', config.id, chunk));
     agent.on('status', () => this.emit('agentStatus', config.id));
+    agent.on('screen', () => this.emit('agentScreen', config.id));
     agent.on('done', (full) => {
       this.emit('agentDone', config.id, full);
       // Auto-pipe
@@ -45,6 +48,10 @@ class AgentManager extends EventEmitter {
 
     this.agents.set(config.id, agent);
     this.emit('agentsChanged');
+    // Eagerly start interactive agents so their startup screen (logo,
+    // banner, MCP init) is captured by the headless Terminal and visible
+    // in the OutputPanel raw view before the user sends anything.
+    agent.start();
     return agent;
   }
 
